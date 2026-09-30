@@ -15,6 +15,7 @@ drive these labels from your own server with no vendor cloud involved.
 - [Writing image data](#writing-image-data)
 - [Frame format](#frame-format)
 - [Framebuffer layout](#framebuffer-layout)
+- [Quick start: one tag, no phone, no server](#quick-start-one-tag-no-phone-no-server)
 - [Vendor server API](#vendor-server-api)
 - [Error codes](#error-codes)
 - [Dangerous commands](#dangerous-commands)
@@ -245,6 +246,162 @@ probe the hardware directly: write a buffer with one known byte range set
 to ink and observe which part of the screen darkens. Four probes
 (`0–1000`, `1000–2000`, `2000–3000`, `3000–4000`) plus one 32-byte probe
 resolve the layout unambiguously.
+
+---
+
+## Quick start: one tag, no phone, no server
+
+The shortest path from nothing to a picture on the panel. Runs on a laptop
+with a Bluetooth adapter — no vendor app, no backend, no ESP32.
+
+```bash
+pip install bleak pillow pycryptodome
+python esl_push.py "HELLO" 
+```
+
+```python
+#!/usr/bin/env python3
+"""
+esl_push.py — render text and push it to the first Zhsunyco ESL in range.
+
+    python esl_push.py "Some text"
+"""
+import asyncio, base64, struct, sys, zlib
+from bleak import BleakClient, BleakScanner
+from Crypto.Cipher import AES
+from PIL import Image, ImageDraw, ImageFont
+
+W, H, COLBYTES = 250, 122, 32
+
+SVC    = "30323032-4c53-4545-4c42-4b4e494c4f57"
+CHR_EPD    = "31323032-4c53-4545-4c42-4b4e494c4f57"
+CHR_CRYPTO = "33323032-4c53-4545-4c42-4b4e494c4f57"
+
+KEY = bytes([0x9B, 0x60, 0x9F, 0x28, 0xBC, 0x49, 0xE2, 0x57,
+             0x29, 0xBD, 0x7B, 0x8D, 0xF2, 0x2B, 0x44, 0x20])
+
+PALETTE = {                       # 2-bit code -> RGB
+    0b00: (0, 0, 0),              # black
+    0b01: (255, 255, 255),        # white
+    0b10: (230, 180, 30),         # yellow
+    0b11: (220, 30, 30),          # red
+}
+
+
+def nearest(rgb):
+    r, g, b = rgb[:3]
+    return min(PALETTE, key=lambda c: sum((a - v) ** 2 for a, v in zip(PALETTE[c], (r, g, b))))
+
+
+def render(text):
+    """Anything that produces a 250x122 RGB image works — this is just a demo."""
+    img = Image.new("RGB", (W, H), "white")
+    d = ImageDraw.Draw(img)
+    try:
+        big = ImageFont.truetype("DejaVuSans-Bold.ttf", 34)
+        small = ImageFont.truetype("DejaVuSans.ttf", 13)
+    except OSError:
+        big = small = ImageFont.load_default()
+
+    d.rectangle([0, 0, W - 1, 21], fill=(230, 180, 30))     # yellow header
+    d.text((6, 3), "ELECTRONIC SHELF LABEL", font=small, fill=(0, 0, 0))
+    d.text((6, 45), text, font=big, fill=(220, 30, 30))     # red body
+    d.rectangle([0, H - 15, W - 1, H - 1], fill=(0, 0, 0))  # black footer
+    d.text((6, H - 13), "250 x 122 - four colours", font=small, fill=(255, 255, 255))
+    return img
+
+
+def encode(img):
+    """Image -> ready-to-write frame bytes."""
+    px = img.convert("RGB").load()
+    buf = bytearray(b"\x55" * (W * COLBYTES))              # 0x55 = all white
+
+    for x in range(W):
+        for y in range(H):
+            p = H - 1 - y                                   # bottom-up
+            byte = x * COLBYTES + (p >> 2)                  # four pixels per byte
+            shift = 6 - 2 * (p & 3)                         # MSB pair first
+            buf[byte] = (buf[byte] & ~(0b11 << shift)) | (nearest(px[x, y]) << shift)
+
+    comp = zlib.compressobj(9, zlib.DEFLATED, -15)          # raw DEFLATE
+    blob = comp.compress(bytes(buf)) + comp.flush()
+    return b"\xA5\xA6\x01\x02\x01" + struct.pack("<H", len(blob)) + blob
+
+
+def is_esl(dev, adv):
+    md = adv.manufacturer_data.get(0xBBAA)                  # vendor company ID
+    return md is not None and (adv.local_name or "").startswith("WL") \
+           and dev.address.upper().startswith("66:66")
+
+
+async def main(text):
+    print("scanning...")
+    found = await BleakScanner.discover(timeout=8.0, return_adv=True)
+    tags = [(d, a) for d, a in found.values() if is_esl(d, a)]
+    if not tags:
+        sys.exit("no ESL tags in range")
+
+    dev, adv = tags[0]
+    md = adv.manufacturer_data[0xBBAA]
+    battery = int.from_bytes(md[-2:], "big") if len(md) >= 2 else 0
+    print(f"found {adv.local_name} at {dev.address}, {battery} mV, rssi {adv.rssi}")
+
+    frame = encode(render(text))
+    print(f"frame: {len(frame)} bytes")
+
+    async with BleakClient(dev, timeout=20.0) as cli:
+        # 1. unlock: encrypt the 16-byte challenge and write it back
+        challenge = await cli.read_gatt_char(CHR_CRYPTO)
+        if len(challenge) != 16:
+            sys.exit(f"unexpected challenge length {len(challenge)}")
+        await cli.write_gatt_char(CHR_CRYPTO,
+                                  AES.new(KEY, AES.MODE_ECB).encrypt(bytes(challenge)),
+                                  response=True)
+        print("unlocked")
+
+        # 2. data packets: 00 A5 | offset LE32 | payload
+        chunk = max(20, cli.mtu_size - 9)
+        for off in range(0, len(frame), chunk):
+            part = frame[off:off + chunk]
+            await cli.write_gatt_char(CHR_EPD,
+                                      b"\x00\xA5" + struct.pack("<I", off) + part,
+                                      response=True)
+            await asyncio.sleep(0.012)
+            print(f"  {off + len(part)}/{len(frame)}", end="\r")
+
+        # 3. finish packet: 02 A5 | total length LE32 — triggers the refresh
+        await cli.write_gatt_char(CHR_EPD,
+                                  b"\x02\xA5" + struct.pack("<I", len(frame)),
+                                  response=True)
+        print("\nsent - the panel redraws over 10-15 seconds")
+        await asyncio.sleep(3)                              # let it settle
+
+
+if __name__ == "__main__":
+    asyncio.run(main(sys.argv[1] if len(sys.argv) > 1 else "HELLO"))
+```
+
+### What to expect
+
+- Scanning finds the tag within a couple of seconds; it advertises often.
+- The whole transfer is four or five packets and finishes in under a second.
+- The panel then redraws visibly for 10 to 15 seconds. That is normal for
+  a four-colour e-paper — yellow and red particles move slowly.
+- If the write fails partway, wait several minutes before retrying. The tag
+  stops accepting connections for a while after a dropped transfer.
+
+### Swapping in your own artwork
+
+`render()` is the only part you would replace. Anything that yields a
+250 × 122 RGB image works — a PNG loaded from disk, a chart, a barcode.
+`encode()` quantises to the four supported colours automatically by nearest
+squared distance, so approximate colours are fine; just keep in mind that
+anything greenish lands on yellow and anything pink lands on red.
+
+For photographs, dither before encoding — hard quantisation of continuous
+tone looks poor on four colours. Floyd-Steinberg against the four-colour
+palette works well, and flat silhouettes need no dithering at all.
+
 
 ---
 
